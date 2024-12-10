@@ -7,9 +7,9 @@ import requests
 with open('config.json', 'r') as config_file:
     config = json.load(config_file)
 
-SONARR_API_URL = config['SONARR_API_URL']
+SONARR_API_URL = config['SONARR_API_URL'] + "/api/v3"
 SONARR_API_KEY = config['SONARR_API_KEY']
-RADARR_API_URL = config['RADARR_API_URL']
+RADARR_API_URL = config['RADARR_API_URL'] + "/api/v3"
 RADARR_API_KEY = config['RADARR_API_KEY']
 API_TIMEOUT = config['API_TIMEOUT']
 STRIKE_COUNT = config['STRIKE_COUNT']
