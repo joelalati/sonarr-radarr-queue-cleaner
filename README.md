@@ -23,9 +23,9 @@ To use with Docker:
    nano config.json
    ```
 3. Once you've saved the config:
-  ```
-  docker build -t media-cleaner .
-  ```
+   ```
+   docker build -t media-cleaner .
+   ```
 4. Then start the container.
    ```
    docker run -d --name media-cleaner media-cleaner
