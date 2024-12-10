@@ -60,7 +60,7 @@ async def make_api_delete(url, api_key, params=None):
 # Function to check the status of items and update strikes
 async def check_stalled_items():
     global strikes
-    # Example function to get stalled items from Sonarr and Radarr
+    # Get stalled items from Sonarr and Radarr
     stalled_items = await get_stalled_items()
     
     for item in stalled_items:
@@ -78,15 +78,28 @@ async def check_stalled_items():
             if item_id in strikes:
                 strikes[item_id] = 0
 
-# Example function to get stalled items from Sonarr and Radarr
+# Function to get stalled items from Sonarr and Radarr
 async def get_stalled_items():
     # Implement the logic to get stalled items from Sonarr and Radarr
-    return []
+    sonarr_stalled_items = await make_api_request(f"{SONARR_API_URL}/queue", SONARR_API_KEY)
+    radarr_stalled_items = await make_api_request(f"{RADARR_API_URL}/queue", RADARR_API_KEY)
+    
+    stalled_items = []
+    if sonarr_stalled_items:
+        stalled_items.extend([item for item in sonarr_stalled_items if item['status'] == 'stalled'])
+    if radarr_stalled_items:
+        stalled_items.extend([item for item in radarr_stalled_items if item['status'] == 'stalled'])
+    
+    return stalled_items
 
-# Example function to blacklist, remove, and search an item
+# Function to blacklist, remove, and search an item
 async def blacklist_remove_search(item_id):
     # Implement the logic to blacklist, remove, and search an item
-    pass
+    logging.info(f"Blacklisting, removing, and searching item with ID {item_id}")
+    # Example API calls to blacklist, remove, and search
+    await make_api_delete(f"{SONARR_API_URL}/queue/{item_id}", SONARR_API_KEY)
+    await make_api_delete(f"{RADARR_API_URL}/queue/{item_id}", RADARR_API_KEY)
+    # Add additional logic as needed
 
 # Schedule the check to run every 10 minutes
 async def main():
