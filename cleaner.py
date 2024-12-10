@@ -8,6 +8,10 @@ import requests
 from requests.exceptions import RequestException
 import json
 
+# Configuration variables
+API_TIMEOUT = 600  # Example value, adjust as needed
+STRIKE_COUNT = 5  # Default strike count, can be overridden by user
+
 # Initialize the strike count dictionary
 strike_counts = {}
 
@@ -25,9 +29,6 @@ RADARR_API_URL = (os.environ['RADARR_URL']) + "/api/v3"
 # API key for Sonarr and Radarr
 SONARR_API_KEY = (os.environ['SONARR_API_KEY'])
 RADARR_API_KEY = (os.environ['RADARR_API_KEY'])
-
-# Timeout for API requests in seconds
-API_TIMEOUT = int(os.environ['API_TIMEOUT']) # 10 minutes
 
 # Function to make API requests with error handling
 async def make_api_request(url, api_key, params=None):
@@ -73,7 +74,7 @@ async def remove_stalled_sonarr_downloads():
                         strike_counts[item_id] = 0
                     strike_counts[item_id] += 1
                     logging.info(f'Item {item["title"]} has {strike_counts[item_id]} strikes')
-                    if strike_counts[item_id] >= 5:
+                    if strike_counts[item_id] >= STRIKE_COUNT:
                         logging.info(f'Researching stalled Sonarr download: {item["title"]}')
                         await make_api_delete(f'{SONARR_API_URL}/queue/{item_id}', SONARR_API_KEY, {'removeFromClient': 'true', 'blocklist': 'true'})
                         del strike_counts[item_id]
@@ -98,7 +99,7 @@ async def remove_stalled_radarr_downloads():
                         strike_counts[item_id] = 0
                     strike_counts[item_id] += 1
                     logging.info(f'Item {item["title"]} has {strike_counts[item_id]} strikes')
-                    if strike_counts[item_id] >= 5:
+                    if strike_counts[item_id] >= STRIKE_COUNT:
                         logging.info(f'Researching stalled Radarr download: {item["title"]}')
                         await make_api_delete(f'{RADARR_API_URL}/queue/{item_id}', RADARR_API_KEY, {'removeFromClient': 'true', 'blocklist': 'true'})
                         del strike_counts[item_id]
@@ -120,7 +121,7 @@ async def main():
         logging.info('Running media-tools script')
         await remove_stalled_sonarr_downloads()
         await remove_stalled_radarr_downloads()
-        logging.info('Finished running media-tools script. Sleeping for 10 minutes.')
+        logging.info(f'Finished running media-tools script. Sleeping for {API_TIMEOUT / 60} minutes.')
         await asyncio.sleep(API_TIMEOUT)
 
 if __name__ == '__main__':
