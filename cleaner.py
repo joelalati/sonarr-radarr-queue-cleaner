@@ -8,9 +8,16 @@ import requests
 from requests.exceptions import RequestException
 import json
 
-# Configuration variables
-API_TIMEOUT = 600  # Example value, adjust as needed
-STRIKE_COUNT = 5  # Default strike count, can be overridden by user
+# Load configuration from config.json
+with open('config.json', 'r') as config_file:
+    config = json.load(config_file)
+
+SONARR_API_URL = config['SONARR_API_URL']
+SONARR_API_KEY = config['SONARR_API_KEY']
+RADARR_API_URL = config['RADARR_API_URL']
+RADARR_API_KEY = config['RADARR_API_KEY']
+API_TIMEOUT = config['API_TIMEOUT']
+STRIKE_COUNT = config['STRIKE_COUNT']
 
 # Initialize the strike count dictionary
 strike_counts = {}
@@ -21,14 +28,6 @@ logging.basicConfig(
     level=logging.INFO, 
     handlers=[logging.StreamHandler()]
 )
-
-# Sonarr and Radarr API endpoints
-SONARR_API_URL = (os.environ['SONARR_URL']) + "/api/v3"
-RADARR_API_URL = (os.environ['RADARR_URL']) + "/api/v3"
-
-# API key for Sonarr and Radarr
-SONARR_API_KEY = (os.environ['SONARR_API_KEY'])
-RADARR_API_KEY = (os.environ['RADARR_API_KEY'])
 
 # Function to make API requests with error handling
 async def make_api_request(url, api_key, params=None):

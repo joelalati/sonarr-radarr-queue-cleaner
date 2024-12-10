@@ -1,0 +1,8 @@
+{
+    "SONARR_API_URL": "http://your-sonarr-url",
+    "SONARR_API_KEY": "your-sonarr-api-key",
+    "RADARR_API_URL": "http://your-radarr-url",
+    "RADARR_API_KEY": "your-radarr-api-key",
+    "API_TIMEOUT": 600,
+    "STRIKE_COUNT": 5
+}
