@@ -8,6 +8,9 @@ import requests
 from requests.exceptions import RequestException
 import json
 
+# Initialize the strike count dictionary
+strike_counts = {}
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s]: %(message)s', 
@@ -25,9 +28,6 @@ RADARR_API_KEY = (os.environ['RADARR_API_KEY'])
 
 # Timeout for API requests in seconds
 API_TIMEOUT = int(os.environ['API_TIMEOUT']) # 10 minutes
-
-# Dictionary to store strikes for each item
-strikes = {}
 
 # Function to make API requests with error handling
 async def make_api_request(url, api_key, params=None):
@@ -51,61 +51,78 @@ async def make_api_delete(url, api_key, params=None):
         response.raise_for_status()
         return response.json()
     except RequestException as e:
-        logging.error(f'Error making API delete request to {url}: {e}')
+        logging.error(f'Error making API request to {url}: {e}')
         return None
     except ValueError as e:
         logging.error(f'Error parsing JSON response from {url}: {e}')
         return None
-
-# Function to check the status of items and update strikes
-async def check_stalled_items():
-    global strikes
-    # Get stalled items from Sonarr and Radarr
-    stalled_items = await get_stalled_items()
     
-    for item in stalled_items:
-        item_id = item['id']
-        if item['status'] == 'stalled':
-            if item_id in strikes:
-                strikes[item_id] += 1
+# Function to remove stalled Sonarr downloads
+async def remove_stalled_sonarr_downloads():
+    logging.info('Checking Sonarr queue...')
+    sonarr_url = f'{SONARR_API_URL}/queue'
+    sonarr_queue = await make_api_request(sonarr_url, SONARR_API_KEY, {'page': '1', 'pageSize': await count_records(SONARR_API_URL,SONARR_API_KEY)})
+    if (sonarr_queue is not None and 'records' in sonarr_queue):
+        logging.info('Processing Sonarr queue...')
+        for item in sonarr_queue['records']:
+            if 'title' in item and 'status' in item and 'trackedDownloadStatus' in item:
+                logging.info(f'Checking the status of {item["title"]}')
+                if item['status'] == 'warning' and item['errorMessage'] == 'The download is stalled with no connections':
+                    item_id = item['id']
+                    if item_id not in strike_counts:
+                        strike_counts[item_id] = 0
+                    strike_counts[item_id] += 1
+                    logging.info(f'Item {item["title"]} has {strike_counts[item_id]} strikes')
+                    if strike_counts[item_id] >= 5:
+                        logging.info(f'Researching stalled Sonarr download: {item["title"]}')
+                        await make_api_delete(f'{SONARR_API_URL}/queue/{item_id}', SONARR_API_KEY, {'removeFromClient': 'true', 'blocklist': 'true'})
+                        del strike_counts[item_id]
             else:
-                strikes[item_id] = 1
-            
-            if strikes[item_id] >= 6:
-                await blacklist_remove_search(item_id)
-                strikes.pop(item_id)
-        else:
-            if item_id in strikes:
-                strikes[item_id] = 0
+                logging.warning('Skipping item in Sonarr queue due to missing or invalid keys')
+    else:
+        logging.warning('Sonarr queue is None or missing "records" key')
 
-# Function to get stalled items from Sonarr and Radarr
-async def get_stalled_items():
-    # Implement the logic to get stalled items from Sonarr and Radarr
-    sonarr_stalled_items = await make_api_request(f"{SONARR_API_URL}/queue", SONARR_API_KEY)
-    radarr_stalled_items = await make_api_request(f"{RADARR_API_URL}/queue", RADARR_API_KEY)
-    
-    stalled_items = []
-    if sonarr_stalled_items:
-        stalled_items.extend([item for item in sonarr_stalled_items if item['status'] == 'stalled'])
-    if radarr_stalled_items:
-        stalled_items.extend([item for item in radarr_stalled_items if item['status'] == 'stalled'])
-    
-    return stalled_items
+# Function to remove stalled Radarr downloads
+async def remove_stalled_radarr_downloads():
+    logging.info('Checking radarr queue...')
+    radarr_url = f'{RADARR_API_URL}/queue'
+    radarr_queue = await make_api_request(radarr_url, RADARR_API_KEY, {'page': '1', 'pageSize': await count_records(RADARR_API_URL,RADARR_API_KEY)})
+    if radarr_queue is not None and 'records' in radarr_queue:
+        logging.info('Processing Radarr queue...')
+        for item in radarr_queue['records']:
+            if 'title' in item and 'status' in item and 'trackedDownloadStatus' in item:
+                logging.info(f'Checking the status of {item["title"]}')
+                if item['status'] == 'warning' and item['errorMessage'] == 'The download is stalled with no connections':
+                    item_id = item['id']
+                    if item_id not in strike_counts:
+                        strike_counts[item_id] = 0
+                    strike_counts[item_id] += 1
+                    logging.info(f'Item {item["title"]} has {strike_counts[item_id]} strikes')
+                    if strike_counts[item_id] >= 5:
+                        logging.info(f'Researching stalled Radarr download: {item["title"]}')
+                        await make_api_delete(f'{RADARR_API_URL}/queue/{item_id}', RADARR_API_KEY, {'removeFromClient': 'true', 'blocklist': 'true'})
+                        del strike_counts[item_id]
+            else:
+                logging.warning('Skipping item in Radarr queue due to missing or invalid keys')
+    else:
+        logging.warning('Radarr queue is None or missing "records" key')
 
-# Function to blacklist, remove, and search an item
-async def blacklist_remove_search(item_id):
-    # Implement the logic to blacklist, remove, and search an item
-    logging.info(f"Blacklisting, removing, and searching item with ID {item_id}")
-    # Example API calls to blacklist, remove, and search
-    await make_api_delete(f"{SONARR_API_URL}/queue/{item_id}", SONARR_API_KEY)
-    await make_api_delete(f"{RADARR_API_URL}/queue/{item_id}", RADARR_API_KEY)
-    # Add additional logic as needed
+# Make a request to view and count items in queue and return the number.
+async def count_records(API_URL, API_Key):
+    the_url = f'{API_URL}/queue'
+    the_queue = await make_api_request(the_url, API_Key)
+    if the_queue is not None and 'records' in the_queue:
+        return the_queue['totalRecords']
 
-# Schedule the check to run every 10 minutes
+# Main function
 async def main():
     while True:
-        await check_stalled_items()
-        await asyncio.sleep(600)  # Sleep for 10 minutes
+        logging.info('Running media-tools script')
+        await remove_stalled_sonarr_downloads()
+        await remove_stalled_radarr_downloads()
+        logging.info('Finished running media-tools script. Sleeping for 10 minutes.')
+        await asyncio.sleep(API_TIMEOUT)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
