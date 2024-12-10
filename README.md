@@ -4,7 +4,7 @@ A simple Sonarr and Radarr script to clean out stalled downloads.
 A "strike" system to ensure the stalled downloads have been stalled for a while.
 The amount of strikes and amount of time between checks can be changed in the config file.
 
-To use with <Docker>:
+To use with Docker:
   1. ```
      git clone https://github.com/PaeyMoopy/sonarr-radarr-queue-cleaner.git
 
