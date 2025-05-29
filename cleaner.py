@@ -200,6 +200,23 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
 
         logging.info(f'Processing item: {title} (ID: {item_id}) - Status: {status}, Tracked Status: {tracked_download_status}, Tracked State: {tracked_download_state}, Error: {error_message}, Status Messages: {all_status_messages_text}, Size Left: {current_sizeleft}')
 
+        # --- Handle "Failed" downloads ---
+        if status == 'failed':
+            logging.warning(f'Found failed download: "{title}" (ID: {item_id}). Deleting and blocklisting.')
+            delete_result = make_api_delete(
+                f'{api_url}/queue/{item_id}',
+                api_key,
+                {'removeFromClient': 'true', 'blocklist': 'true'}
+            )
+            if delete_result:
+                logging.info(f'Successfully deleted and blocklisted failed download: "{title}"')
+                # Clean up tracking info (though unlikely to be in these for a 'failed' item)
+                if item_id in strike_counts: del strike_counts[item_id]
+                if item_id in download_progress_tracking: del download_progress_tracking[item_id]
+            else:
+                logging.error(f'Failed to delete and blocklist failed download: "{title}"')
+            continue # Move to the next item in the queue
+
         # --- Handle "Potentially dangerous file" with specific tracked status/state ---
         # This logic now applies to both Sonarr and Radarr
         is_dangerous_file_warning = any("Caution: Found potentially dangerous file" in msg for msg in all_status_messages_text)
