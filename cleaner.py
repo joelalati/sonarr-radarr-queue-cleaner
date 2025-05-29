@@ -5,7 +5,7 @@ import requests
 from typing import Optional, Any # Import Optional and Any for type hinting
 from datetime import datetime # Import datetime for parsing timestamps (still useful for other time-based checks if needed)
 
-# Load configuration from config.json
+# --- Configuration Loading ---
 try:
     with open('config.json', 'r') as config_file:
         config = json.load(config_file)
@@ -24,27 +24,24 @@ RADARR_API_KEY = config.get('RADARR_API_KEY', '')
 API_TIMEOUT = config.get('API_TIMEOUT', 300) # Default to 300 seconds (5 minutes) for API calls and sleep
 STRIKE_COUNT = config.get('STRIKE_COUNT', 3) # Default to 3 strikes for "no connections" stalls
 
-# Global dictionaries for tracking various download states
+# --- Global Dictionaries for Tracking Download States ---
 strike_counts = {} # For "stalled with no connections"
+download_progress_tracking = {} # For non-progressing download detection using 'sizeleft'
 
-# For non-progressing download detection using 'sizeleft'
-# Stores the last observed 'sizeleft' and a counter for consecutive checks with no progress
-download_progress_tracking = {}
-
-# Constants for non-progressing download detection using 'sizeleft'
+# --- Constants for Non-Progressing Download Detection ---
 # These define how many checks (API_TIMEOUT intervals) a download must show no progress
 # in its 'sizeleft' before it's considered stuck and deleted.
 NO_PROGRESS_THRESHOLD_BYTES = 1024 * 1024 # 1 MB - minimum change in sizeleft to count as progress
 NO_PROGRESS_STRIKE_COUNT = 3             # Number of consecutive checks with no significant progress before deleting
 
-# Set up logging
+# --- Logging Setup ---
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s]: %(message)s',
     level=logging.INFO,
     handlers=[logging.StreamHandler()]
 )
 
-# Function to make API requests (GET)
+# --- API Request Functions ---
 def make_api_request(url: str, api_key: str, params: Optional[dict] = None) -> Optional[Any]:
     """
     Makes a GET API request to the specified URL.
@@ -71,7 +68,6 @@ def make_api_request(url: str, api_key: str, params: Optional[dict] = None) -> O
         logging.error(f'Error making API request to {url}: {e}')
         return None
 
-# Function to make API delete requests (DELETE)
 def make_api_delete(url: str, api_key: str, params: Optional[dict] = None) -> Optional[Any]:
     """
     Makes a DELETE API request to the specified URL.
@@ -103,7 +99,6 @@ def make_api_delete(url: str, api_key: str, params: Optional[dict] = None) -> Op
         logging.error(f'Error making API delete request to {url}: {e}')
         return None
 
-# Function to make API post requests (POST)
 def make_api_post(url: str, api_key: str, data: Optional[dict] = None) -> Optional[Any]:
     """
     Makes a POST API request to the specified URL. Used for sending commands like search.
@@ -131,7 +126,7 @@ def make_api_post(url: str, api_key: str, data: Optional[dict] = None) -> Option
         logging.error(f'Error making API POST request to {url}: {e}')
         return None
 
-# Function to count records in a queue
+# --- Helper Functions ---
 def count_records(api_url: str, api_key: str) -> int:
     """
     Counts the total number of records in a given API queue.
@@ -150,6 +145,76 @@ def count_records(api_url: str, api_key: str) -> int:
     logging.warning(f"Could not retrieve total records for {api_url}/queue. Returning 0.")
     return 0
 
+def _delete_and_blocklist_item(item_id: int, title: str, api_url: str, api_key: str, queue_name: str, reason: str) -> bool:
+    """
+    Helper function to delete and blocklist a queue item, and clean up its tracking info.
+
+    Args:
+        item_id (int): The ID of the item to delete.
+        title (str): The title of the item for logging.
+        api_url (str): The base API URL (Sonarr/Radarr).
+        api_key (str): The API key.
+        queue_name (str): 'Sonarr' or 'Radarr'.
+        reason (str): The reason for deletion (e.g., 'failed', 'dangerous file', 'stalled').
+
+    Returns:
+        bool: True if deletion was successful, False otherwise.
+    """
+    logging.warning(f'Found {reason} download: "{title}" (ID: {item_id}). Deleting and blocklisting.')
+    delete_result = make_api_delete(
+        f'{api_url}/queue/{item_id}',
+        api_key,
+        {'removeFromClient': 'true', 'blocklist': 'true'}
+    )
+    if delete_result:
+        logging.info(f'Successfully deleted and blocklisted {queue_name} item ({reason}): {title}')
+        # Clean up tracking info for this item across all systems
+        if item_id in strike_counts:
+            del strike_counts[item_id]
+        if item_id in download_progress_tracking:
+            del download_progress_tracking[item_id]
+        return True
+    else:
+        logging.error(f'Failed to delete and blocklist {queue_name} item ({reason}): {title}')
+        return False
+
+def _trigger_search_command(item: dict, api_url: str, api_key: str, is_sonarr: bool, title: str, queue_name: str) -> None:
+    """
+    Helper function to trigger a re-search command for a series or movie.
+
+    Args:
+        item (dict): The queue item dictionary.
+        api_url (str): The base API URL (Sonarr/Radarr).
+        api_key (str): The API key.
+        is_sonarr (bool): True if Sonarr, False if Radarr.
+        title (str): The title of the item for logging.
+        queue_name (str): 'Sonarr' or 'Radarr'.
+    """
+    search_payload = {}
+    if is_sonarr:
+        series_id = item.get('seriesId')
+        if series_id:
+            search_payload = {"name": "SeriesSearch", "seriesId": series_id}
+        else:
+            logging.warning(f'Could not find SeriesId for re-search for Sonarr item: {title} (ID: {item.get("id")})')
+    else: # Radarr
+        movie_id = item.get('movieId')
+        if movie_id:
+            search_payload = {"name": "MovieSearch", "movieId": movie_id}
+        else:
+            logging.warning(f'Could not find MovieId for re-search for Radarr item: {title} (ID: {item.get("id")})')
+
+    if search_payload:
+        logging.debug(f"Attempting to trigger search with payload: {search_payload}")
+        search_result = make_api_post(f'{api_url}/command', api_key, search_payload)
+        if search_result:
+            logging.info(f'Successfully triggered re-search for {queue_name} item: {title}')
+        else:
+            logging.error(f'Failed to trigger re-search for {queue_name} item: {title}')
+    else:
+        logging.warning(f'No valid search payload generated for {queue_name} item: {title}')
+
+# --- Main Queue Processing Logic ---
 async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> None:
     """
     Processes the Sonarr or Radarr queue to identify and act on stalled,
@@ -183,8 +248,8 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
         tracked_download_status = item.get('trackedDownloadStatus')
         tracked_download_state = item.get('trackedDownloadState')
         error_message = item.get('errorMessage')
-        status_messages = item.get("statusMessages") # Correctly get statusMessages
-        current_sizeleft = item.get('sizeleft') # Get current sizeleft
+        status_messages = item.get("statusMessages")
+        current_sizeleft = item.get('sizeleft')
 
         # Basic validation for essential keys
         if not all(k in item for k in ['id', 'title', 'status', 'trackedDownloadStatus', 'trackedDownloadState']):
@@ -202,75 +267,21 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
 
         # --- Handle "Failed" downloads ---
         if status == 'failed':
-            logging.warning(f'Found failed download: "{title}" (ID: {item_id}). Deleting and blocklisting.')
-            delete_result = make_api_delete(
-                f'{api_url}/queue/{item_id}',
-                api_key,
-                {'removeFromClient': 'true', 'blocklist': 'true'}
-            )
-            if delete_result:
-                logging.info(f'Successfully deleted and blocklisted failed download: "{title}"')
-                # Clean up tracking info (though unlikely to be in these for a 'failed' item)
-                if item_id in strike_counts: del strike_counts[item_id]
-                if item_id in download_progress_tracking: del download_progress_tracking[item_id]
-            else:
-                logging.error(f'Failed to delete and blocklist failed download: "{title}"')
-            continue # Move to the next item in the queue
+            _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "failed")
+            continue # Move to the next item
 
         # --- Handle "Potentially dangerous file" with specific tracked status/state ---
-        # This logic now applies to both Sonarr and Radarr
         is_dangerous_file_warning = any("Caution: Found potentially dangerous file" in msg for msg in all_status_messages_text)
         
-        # Check if the item is in a 'warning' state and 'importPending' state
-        # and has the dangerous file warning.
         if is_dangerous_file_warning and \
            tracked_download_status == "warning" and \
            tracked_download_state == "importPending":
 
-            logging.warning(f'Potentially dangerous file found for {queue_name} item: {title} (ID: {item_id}). Deleting, blocklisting, and re-searching.')
+            if _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "potentially dangerous file"):
+                _trigger_search_command(item, api_url, api_key, is_sonarr, title, queue_name)
+            continue # Move to the next item
 
-            # Delete and blocklist the item
-            delete_result = make_api_delete(
-                f'{api_url}/queue/{item_id}',
-                api_key,
-                {'removeFromClient': 'true', 'blocklist': 'true'}
-            )
-            if delete_result:
-                logging.info(f'Successfully deleted and blocklisted {queue_name} item (dangerous file): {title}')
-
-                # Trigger re-search for the series/movie
-                search_payload = {}
-                if is_sonarr:
-                    series_id = item.get('seriesId')
-                    if series_id:
-                        search_payload = {"name": "SeriesSearch", "seriesId": series_id}
-                    else:
-                        logging.warning(f'Could not find SeriesId for re-search for Sonarr item: {title} (ID: {item_id})')
-                else: # Radarr
-                    movie_id = item.get('movieId') # Radarr queue items should have 'movieId'
-                    if movie_id:
-                        search_payload = {"name": "MovieSearch", "movieId": movie_id}
-                    else:
-                        logging.warning(f'Could not find MovieId for re-search for Radarr item: {title} (ID: {item_id})')
-
-                if search_payload:
-                    logging.debug(f"Attempting to trigger search with payload: {search_payload}") # Added for debugging 500 error
-                    search_result = make_api_post(f'{api_url}/command', api_key, search_payload)
-                    if search_result:
-                        logging.info(f'Successfully triggered re-search for {queue_name} item: {title}')
-                    else:
-                        logging.error(f'Failed to trigger re-search for {queue_name} item: {title}')
-                else:
-                    logging.warning(f'No valid search payload generated for {queue_name} item: {title}')
-
-                # Clean up tracking info for this item across all systems
-                if item_id in strike_counts: del strike_counts[item_id]
-                if item_id in download_progress_tracking: del download_progress_tracking[item_id]
-            else:
-                logging.error(f'Failed to delete and blocklist {queue_name} item (dangerous file): {title}')
-            continue # Move to the next item in the queue
-
-        # --- Handle "Stalled with no connections" error (applies to both Sonarr and Radarr) ---
+        # --- Handle "Stalled with no connections" error ---
         if status == 'warning' and error_message == 'The download is stalled with no connections':
             item_id = item['id']
             if item_id not in strike_counts:
@@ -278,15 +289,7 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
             strike_counts[item_id] += 1
             logging.info(f'Item "{title}" has {strike_counts[item_id]} connection stalls.')
             if strike_counts[item_id] >= STRIKE_COUNT:
-                logging.info(f'Deleting and blocklisting stalled download: "{title}" (ID: {item_id})')
-                delete_result = make_api_delete(f'{api_url}/queue/{item_id}', api_key, {'removeFromClient': 'true', 'blocklist': 'true'})
-                if delete_result:
-                    logging.info(f'Successfully deleted and blocklisted stalled download: "{title}"')
-                    # Clean up tracking info for this item
-                    if item_id in strike_counts: del strike_counts[item_id]
-                    if item_id in download_progress_tracking: del download_progress_tracking[item_id]
-                else:
-                    logging.error(f'Failed to delete and blocklist stalled download: "{title}"')
+                _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "stalled")
             continue # Move to the next item
         elif item_id in strike_counts:
             # Item is no longer stalled by connection issues, reset its strike count
@@ -318,20 +321,14 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
                     logging.warning(f'Download "{title}" (ID: {item_id}) has shown no significant progress. No progress count: {tracking_info["no_progress_count"]}. Size left: {current_sizeleft}.')
 
                     if tracking_info['no_progress_count'] >= NO_PROGRESS_STRIKE_COUNT:
-                        logging.info(f'Deleting and blocklisting non-progressing download (sizeleft stuck): "{title}" (ID: {item_id})')
-                        delete_result = make_api_delete(f'{api_url}/queue/{item_id}', api_key, {'removeFromClient': 'true', 'blocklist': 'true'})
-                        if delete_result:
-                            logging.info(f'Successfully deleted and blocklisted non-progressing download: "{title}"')
-                            # Clean up tracking info for this item
-                            del download_progress_tracking[item_id]
-                        else:
-                            logging.error(f'Failed to delete and blocklist non-progressing download: "{title}"')
+                        _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "non-progressing")
         elif item_id in download_progress_tracking:
             # Item is no longer 'downloading' or sizeleft is missing, remove from tracking
             logging.debug(f"Download {title} (ID: {item_id}) is no longer downloading or missing sizeleft. Removing from tracking.")
             del download_progress_tracking[item_id]
 
 
+# --- Wrapper Functions for Queue Processing ---
 async def remove_stalled_sonarr_downloads() -> None:
     """
     Wrapper function to call the unified queue processing for Sonarr.
@@ -344,7 +341,7 @@ async def remove_stalled_radarr_downloads() -> None:
     """
     await process_queue(RADARR_API_URL, RADARR_API_KEY, is_sonarr=False)
 
-# Main function
+# --- Main Execution Loop ---
 async def main() -> None:
     """
     Main function to run the queue cleaner script periodically.
