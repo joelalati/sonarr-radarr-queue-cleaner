@@ -2,8 +2,8 @@ import asyncio
 import logging
 import json
 import requests
-from typing import Optional, Any # Import Optional and Any for type hinting
-from datetime import datetime # Import datetime for parsing timestamps (still useful for other time-based checks if needed)
+from typing import Optional, Any
+from datetime import datetime, timedelta
 
 # --- Configuration Loading ---
 try:
@@ -33,6 +33,10 @@ download_progress_tracking = {} # For non-progressing download detection using '
 # in its 'sizeleft' before it's considered stuck and deleted.
 NO_PROGRESS_THRESHOLD_BYTES = 1024 * 1024 # 1 MB - minimum change in sizeleft to count as progress
 NO_PROGRESS_STRIKE_COUNT = 3             # Number of consecutive checks with no significant progress before deleting
+
+# --- Global variable for weekly Sonarr search ---
+# Initialize with a past timestamp to trigger search on first run
+last_sonarr_weekly_search_timestamp = 0.0 # Unix timestamp of last search
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -250,6 +254,7 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
         error_message = item.get('errorMessage')
         status_messages = item.get("statusMessages")
         current_sizeleft = item.get('sizeleft')
+        protocol = item.get('protocol') # Get the protocol (usenet or torrent)
 
         # Basic validation for essential keys
         if not all(k in item for k in ['id', 'title', 'status', 'trackedDownloadStatus', 'trackedDownloadState']):
@@ -260,25 +265,69 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
         all_status_messages_text = []
         if isinstance(status_messages, list):
             for sm_entry in status_messages:
+                # Add the 'title' of the status message entry
+                if isinstance(sm_entry, dict) and "title" in sm_entry:
+                    all_status_messages_text.append(sm_entry["title"])
+                # Add messages from the 'messages' list within the entry
                 if isinstance(sm_entry, dict) and "messages" in sm_entry and isinstance(sm_entry["messages"], list):
                     all_status_messages_text.extend(sm_entry["messages"])
 
-        logging.info(f'Processing item: {title} (ID: {item_id}) - Status: {status}, Tracked Status: {tracked_download_status}, Tracked State: {tracked_download_state}, Error: {error_message}, Status Messages: {all_status_messages_text}, Size Left: {current_sizeleft}')
+        logging.info(f'Processing item: {title} (ID: {item_id}) - Status: {status}, Tracked Status: {tracked_download_status}, Tracked State: {tracked_download_state}, Error: {error_message}, Status Messages: {all_status_messages_text}, Size Left: {current_sizeleft}, Protocol: {protocol}')
 
         # --- Handle "Failed" downloads ---
         if status == 'failed':
             _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "failed")
             continue # Move to the next item
 
+        # --- Handle "One or more movies/episodes expected in this release were not imported or missing" ---
+        # This applies to both Sonarr and Radarr
+        is_missing_files_warning = any("not imported or missing" in msg for msg in all_status_messages_text)
+
+        if is_missing_files_warning and \
+           status == "completed" and \
+           tracked_download_status == "warning" and \
+           tracked_download_state == "importPending":
+            
+            logging.warning(f'{queue_name} item: "{title}" (ID: {item_id}) indicates missing files. Deleting and blocklisting (no re-search).')
+            _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "missing files")
+            continue # Move to the next item
+
+        # --- Handle "No files found are eligible for import" ---
+        is_no_eligible_files_warning = any("No files found are eligible for import" in msg for msg in all_status_messages_text)
+
+        if is_no_eligible_files_warning and \
+           status == "completed" and \
+           tracked_download_status == "warning" and \
+           tracked_download_state == "importPending":
+
+            logging.warning(f'No eligible files found for import for {queue_name} item: {title} (ID: {item_id}). Deleting, blocklisting, and re-searching.')
+
+            if _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "no eligible files"):
+                _trigger_search_command(item, api_url, api_key, is_sonarr, title, queue_name)
+            continue # Move to the next item
+
         # --- Handle "Potentially dangerous file" with specific tracked status/state ---
         is_dangerous_file_warning = any("Caution: Found potentially dangerous file" in msg for msg in all_status_messages_text)
-        
+
         if is_dangerous_file_warning and \
            tracked_download_status == "warning" and \
            tracked_download_state == "importPending":
 
+            logging.warning(f'Potentially dangerous file found for {queue_name} item: {title} (ID: {item_id}). Deleting, blocklisting, and re-searching.')
+
             if _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "potentially dangerous file"):
                 _trigger_search_command(item, api_url, api_key, is_sonarr, title, queue_name)
+            continue # Move to the next item
+
+        # --- Handle general "importBlocked" warnings (applies to both Sonarr and Radarr) ---
+        # This will now cover cases where trackedDownloadState is 'importBlocked',
+        # including scenarios like "Not an upgrade" if the API reports it as 'importBlocked'.
+        if status == "completed" and \
+           tracked_download_status == "warning" and \
+           tracked_download_state == "importBlocked":
+            
+            logging.warning(f'{queue_name} item: "{title}" (ID: {item_id}) is completed with a warning and import is blocked. Deleting and blocklisting (no re-search).')
+            _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "import blocked")
             continue # Move to the next item
 
         # --- Handle "Stalled with no connections" error ---
@@ -296,8 +345,8 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
             logging.info(f'Item "{title}" is no longer connection stalled. Resetting strike count.')
             del strike_counts[item_id]
 
-        # --- Handle downloads stuck in "downloading" using 'sizeleft' ---
-        if status == 'downloading' and current_sizeleft is not None:
+        # --- Handle downloads stuck in "downloading" using 'sizeleft' (Only for torrents) ---
+        if status == 'downloading' and current_sizeleft is not None and protocol == 'torrent':
             if item_id not in download_progress_tracking:
                 # First time seeing this item in 'downloading' status, initialize tracking
                 download_progress_tracking[item_id] = {
@@ -323,9 +372,21 @@ async def process_queue(api_url: str, api_key: str, is_sonarr: bool = True) -> N
                     if tracking_info['no_progress_count'] >= NO_PROGRESS_STRIKE_COUNT:
                         _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "non-progressing")
         elif item_id in download_progress_tracking:
-            # Item is no longer 'downloading' or sizeleft is missing, remove from tracking
-            logging.debug(f"Download {title} (ID: {item_id}) is no longer downloading or missing sizeleft. Removing from tracking.")
+            # Item is no longer 'downloading', sizeleft is missing, or it's not a torrent, remove from tracking
+            logging.debug(f"Download {title} (ID: {item_id}) is no longer downloading, missing sizeleft, or is not a torrent. Removing from tracking.")
             del download_progress_tracking[item_id]
+
+        # --- General Fallback for Completed with Warning/Error Status ---
+        # This acts as a catch-all for items that completed downloading but have
+        # a warning or error tracked status and weren't handled by more specific rules above.
+        # This is intentionally placed last among all the status checks that might lead to a 'continue'.
+        if status == "completed" and \
+           (tracked_download_status == "warning" or tracked_download_status == "error"):
+
+            logging.warning(f'{queue_name} item: "{title}" (ID: {item_id}) completed with a general warning/error and was not specifically handled. Deleting, blocklisting, and re-searching.')
+            if _delete_and_blocklist_item(item_id, title, api_url, api_key, queue_name, "general completed warning/error"):
+                _trigger_search_command(item, api_url, api_key, is_sonarr, title, queue_name)
+            continue # Move to the next item
 
 
 # --- Wrapper Functions for Queue Processing ---
@@ -346,10 +407,38 @@ async def main() -> None:
     """
     Main function to run the queue cleaner script periodically.
     """
+    global last_sonarr_weekly_search_timestamp # Declare global to modify it
+
     while True:
         logging.info('Running media-tools script')
         await remove_stalled_sonarr_downloads()
         await remove_stalled_radarr_downloads()
+        
+        # --- Weekly Sonarr Wanted Episodes Search ---
+        current_time = datetime.now().timestamp() # Get current Unix timestamp
+        one_week_in_seconds = 7 * 24 * 60 * 60
+
+        if (current_time - last_sonarr_weekly_search_timestamp) >= one_week_in_seconds:
+            logging.info('It\'s been a week since the last Sonarr wanted episodes search. Triggering MissingEpisodeSearch command.')
+            search_command = {"name": "MissingEpisodeSearch"} 
+            search_result = make_api_post(f'{SONARR_API_URL}/command', SONARR_API_KEY, search_command)
+            if search_result:
+                logging.info('Successfully triggered Sonarr MissingEpisodeSearch for wanted episodes.')
+                last_sonarr_weekly_search_timestamp = current_time # Update timestamp
+            else:
+                logging.error('Failed to trigger Sonarr MissingEpisodeSearch. Check Sonarr logs for details.')
+
+        # Log current strike counts and download progress tracking
+        if strike_counts:
+            logging.info(f'Current connection strike counts: {strike_counts}')
+        else:
+            logging.info('No items currently have connection strikes.')
+            
+        if download_progress_tracking:
+            logging.info(f'Current non-progressing download tracking: {download_progress_tracking}')
+        else:
+            logging.info('No items currently being tracked for non-progressing downloads.')
+
         logging.info(f'Finished running media-tools script. Sleeping for {API_TIMEOUT / 60} minutes.')
         await asyncio.sleep(API_TIMEOUT)
 
